@@ -35,17 +35,14 @@ pub fn render(export: &Export) -> String {
         }
         push_chip(&mut chips, "model", &label);
     }
-    if let Some(project) = &info.project_id {
-        push_chip(&mut chips, "project", &truncate(project, 12));
-    }
     if let Some(dir) = info.location.as_ref().and_then(|l| l.directory.as_deref()) {
         push_chip(&mut chips, "directory", dir);
     }
     if let Some(created) = info.time.as_ref().and_then(|t| t.created) {
         push_chip(&mut chips, "started", &fmt_ts(created));
     }
-    if let Some(wall) = info.time.as_ref().and_then(InfoTime::wall) {
-        push_chip(&mut chips, "wall time", &fmt_duration(wall));
+    if let Some(active) = session_time(export) {
+        push_chip(&mut chips, "session time", &fmt_duration(active));
     }
 
     let mut timeline = String::new();
@@ -126,6 +123,40 @@ pub fn render(export: &Export) -> String {
 // Header / stats
 // ---------------------------------------------------------------------------
 
+/// Total time OpenCode was generating responses, excluding idle gaps between turns.
+fn session_time(export: &Export) -> Option<i64> {
+    let mut intervals: Vec<(i64, i64)> = export
+        .messages
+        .iter()
+        .filter(|message| message.kind == "assistant")
+        .filter_map(|message| {
+            let time = message.time.as_ref()?;
+            let start = time.created?;
+            let end = time.completed?;
+            (end >= start).then_some((start, end))
+        })
+        .collect();
+
+    if intervals.is_empty() {
+        return export.info.time.as_ref().and_then(InfoTime::wall);
+    }
+
+    intervals.sort_unstable();
+    let (mut start, mut end) = intervals[0];
+    let mut total = 0;
+    for (next_start, next_end) in intervals.into_iter().skip(1) {
+        if next_start <= end {
+            end = end.max(next_end);
+        } else {
+            total += end - start;
+            start = next_start;
+            end = next_end;
+        }
+    }
+    total += end - start;
+    Some(total)
+}
+
 fn push_chip(out: &mut String, label: &str, value: &str) {
     let _ = write!(
         out,
@@ -200,37 +231,114 @@ impl Stats {
 
     fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(&card(
+
+        let user_label = plural(self.users, "user prompt", "user prompts");
+        let assistant_label = plural(self.assistants, "assistant message", "assistant messages");
+        let message_bar = meter(
+            &[
+                ("user", self.users as u64),
+                ("assistant", self.assistants as u64),
+            ],
+            &format!("{user_label} · {assistant_label}"),
+        );
+        out.push_str(&card_with_bar(
             "messages",
             &fmt_int(self.messages as u64),
-            &format!("{} user · {} assistant", self.users, self.assistants),
+            &format!("{user_label}\n{assistant_label}"),
+            &message_bar,
         ));
         out.push_str(&card("tool calls", &fmt_int(self.tools as u64), ""));
-        out.push_str(&card("cost", &fmt_cost(self.cost), ""));
-        out.push_str(&card(
-            "tokens in",
-            &fmt_int(self.tokens_in),
+
+        let total_input = self.tokens_in + self.cache_read + self.cache_write;
+        let uncached_input = total_input.saturating_sub(self.cache_read);
+        let cached_pct = if total_input == 0 {
+            0.0
+        } else {
+            self.cache_read as f64 * 100.0 / total_input as f64
+        };
+        let input_hint = format!(
+            "{} uncached\n{} cached ({cached_pct:.1}%)",
+            fmt_compact(uncached_input),
+            fmt_compact(self.cache_read)
+        );
+        let input_bar = meter(
+            &[
+                ("cached", self.cache_read),
+                ("uncached", uncached_input),
+            ],
             &format!(
-                "{} cache read · {} written",
-                fmt_int(self.cache_read),
-                fmt_int(self.cache_write)
+                "{} cached ({cached_pct:.1}%), {} uncached tokens",
+                fmt_compact(self.cache_read),
+                fmt_compact(uncached_input)
             ),
+        );
+
+        out.push_str(&card("cost", &fmt_cost(self.cost), ""));
+        out.push_str(&card_with_bar(
+            "total input tokens",
+            &fmt_compact(total_input),
+            &input_hint,
+            &input_bar,
         ));
-        out.push_str(&card(
-            "tokens out",
-            &fmt_int(self.tokens_out),
-            &format!("{} reasoning", fmt_int(self.reasoning)),
+
+        let output_hint = if self.reasoning > 0 {
+            format!("{} reasoning", fmt_compact(self.reasoning))
+        } else {
+            String::new()
+        };
+        let output_bar = meter(
+            &[("output-uncached", self.tokens_out)],
+            &format!("{} output tokens", fmt_compact(self.tokens_out)),
+        );
+        out.push_str(&card_with_bar(
+            "total output tokens",
+            &fmt_compact(self.tokens_out),
+            &output_hint,
+            &output_bar,
         ));
         out
     }
 }
 
+fn meter(segments: &[(&str, u64)], aria: &str) -> String {
+    let total: u64 = segments.iter().map(|(_, value)| *value).sum();
+    let aria = esc(aria);
+    let mut out = format!(
+        "<div class=\"meter\" role=\"img\" aria-label=\"{aria}\" title=\"{aria}\">"
+    );
+    if total > 0 {
+        for (class, value) in segments {
+            if *value == 0 {
+                continue;
+            }
+            let pct = *value as f64 * 100.0 / total as f64;
+            let _ = write!(
+                out,
+                "<span class=\"meter-seg {class}\" style=\"width:{pct:.2}%\"></span>"
+            );
+        }
+    }
+    out.push_str("</div>");
+    out
+}
+
+fn plural(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
 fn card(label: &str, value: &str, hint: &str) -> String {
+    card_with_bar(label, value, hint, "")
+}
+
+fn card_with_bar(label: &str, value: &str, hint: &str, bar: &str) -> String {
     let mut out = format!(
         "<div class=\"stat\"><div class=\"label\">{}</div><div class=\"value\">{}</div>",
         esc(label),
         esc(value)
     );
+    if !bar.is_empty() {
+        out.push_str(bar);
+    }
     if !hint.is_empty() {
         let _ = write!(out, "<div class=\"hint\">{}</div>", esc(hint));
     }
@@ -355,16 +463,20 @@ fn render_assistant(message: &Message, idx: usize, time: &str) -> String {
         let input = tokens.input.unwrap_or(0);
         let output = tokens.output.unwrap_or(0);
         if input > 0 || output > 0 {
-            meta.push(format!("↑{} ↓{}", fmt_int(input), fmt_int(output)));
+            meta.push(format!(
+                "<span class=\"up\" title=\"input tokens\">↑{}</span> <span class=\"down\" title=\"output tokens\">↓{}</span>",
+                fmt_compact(input),
+                fmt_compact(output)
+            ));
         }
     }
     if let Some(finish) = &message.finish {
         if !matches!(finish.as_str(), "stop" | "tool_calls" | "tool-calls") {
-            meta.push(finish.clone());
+            meta.push(esc(finish));
         }
     }
     if !meta.is_empty() {
-        let _ = write!(out, "<div class=\"msg-meta\">{}</div>", esc(&meta.join(" · ")));
+        let _ = write!(out, "<div class=\"msg-meta\">{}</div>", meta.join(" · "));
     }
     out.push_str("</header>");
 
@@ -789,6 +901,34 @@ fn fmt_int(value: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Compact token counts: 1.2B, 23.4M, 35K, 272.
+fn fmt_compact(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        compact(value, 1_000_000_000, "B")
+    } else if value >= 1_000_000 {
+        compact(value, 1_000_000, "M")
+    } else if value >= 1_000 {
+        compact(value, 1_000, "K")
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact(value: u64, divisor: u64, suffix: &str) -> String {
+    let scaled = value as f64 / divisor as f64;
+    let text = if scaled >= 100.0 {
+        format!("{scaled:.0}")
+    } else {
+        format!("{scaled:.1}")
+    };
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &text
+    };
+    format!("{text}{suffix}")
 }
 
 fn one_line(text: &str) -> String {

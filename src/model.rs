@@ -14,8 +14,6 @@ pub struct Info {
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(rename = "projectID", default)]
-    pub project_id: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]

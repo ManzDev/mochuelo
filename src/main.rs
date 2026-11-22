@@ -1,72 +1,80 @@
 mod model;
 mod render;
+mod server;
+mod sessions;
+mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use model::Export;
 
-/// Turn an OpenCode session export into a beautiful standalone HTML page.
+/// Inspect OpenCode sessions as a local web page.
 #[derive(Debug, Parser)]
 #[command(name = "oc-observe", version, about, long_about = None)]
 struct Cli {
-    /// Session id (ses_...), a path to an exported .json file, or `-` for stdin
-    session: String,
+    /// Session id (ses_...), a path to an exported .json file, or `-` for stdin.
+    /// Omit it to pick a session interactively.
+    session: Option<String>,
 
-    /// Output HTML path [default: <session-id>.html]
+    /// Write a standalone HTML file instead of starting the local server
     #[arg(short, long, value_name = "FILE", conflicts_with = "stdout")]
     output: Option<PathBuf>,
 
-    /// Print the HTML to stdout instead of writing a file
-    #[arg(long)]
+    /// Print the HTML to stdout instead of serving or writing it
+    #[arg(long, conflicts_with = "no_open")]
     stdout: bool,
 
-    /// Open the generated page in the default browser
-    #[arg(long, conflicts_with = "stdout")]
-    open: bool,
+    /// Don't open the page in the default browser
+    #[arg(long)]
+    no_open: bool,
+
+    /// Port for the local server (0 = random free port)
+    #[arg(long, default_value_t = 0, value_name = "PORT")]
+    port: u16,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let export = load_export(&cli.session)?;
-    let html = render::render(&export);
-
-    if cli.stdout {
-        let mut out = std::io::stdout().lock();
-        out.write_all(html.as_bytes())?;
+    if let Some(path) = &cli.output {
+        let Some(source) = &cli.session else {
+            bail!("`-o/--output` requires a session id, a .json export, or `-` for stdin");
+        };
+        let export = load_export(source)?;
+        write_page(&render::render(&export), path)?;
+        println!("{}", path.display());
         return Ok(());
     }
 
-    let path = cli
-        .output
-        .unwrap_or_else(|| PathBuf::from(format!("{}.html", safe_name(&export.info.id))));
+    if let Some(source) = &cli.session {
+        let export = load_export(source)?;
+        let html = render::render(&export);
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+        if cli.stdout {
+            let mut out = std::io::stdout().lock();
+            out.write_all(html.as_bytes())?;
+            return Ok(());
         }
+
+        return serve(html, cli.port, !cli.no_open);
     }
 
-    fs::write(&path, html.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    println!("{}", path.display());
-
-    if cli.open {
-        if let Err(err) = open_in_browser(&path) {
-            eprintln!("warning: could not open browser: {err}");
-        }
+    if cli.stdout {
+        bail!("`--stdout` requires a session id or `-o/--output`");
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("the interactive picker needs a terminal; pass a session id instead");
     }
 
-    Ok(())
+    tui::run(cli.port, !cli.no_open)
 }
 
-fn load_export(arg: &str) -> Result<Export> {
+pub(crate) fn load_export(arg: &str) -> Result<Export> {
     let raw = if arg == "-" {
         let mut buf = String::new();
         std::io::stdin()
@@ -108,49 +116,58 @@ fn run_export(id: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn safe_name(id: &str) -> String {
-    let cleaned: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if cleaned.trim_matches('-').is_empty() {
-        "session".to_string()
-    } else {
-        cleaned
+fn write_page(html: &str, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    fs::write(path, html).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn serve(html: String, port: u16, open: bool) -> Result<()> {
+    let server = server::Server::start(html, port).context("failed to start local server")?;
+
+    println!("Serving session at {}", server.url());
+    println!("Press Ctrl+C to stop.");
+
+    if open {
+        if let Err(err) = server.wait_ready() {
+            eprintln!("warning: server did not become ready: {err}");
+        }
+        if let Err(err) = open_url(server.url()) {
+            eprintln!("warning: could not open browser: {err}");
+        }
+    }
+
+    loop {
+        std::thread::park();
     }
 }
 
-fn open_in_browser(path: &Path) -> Result<()> {
+pub(crate) fn open_url(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = Command::new("open");
-        c.arg(path);
+        c.arg(url);
         c
     };
 
     #[cfg(target_os = "windows")]
     let mut cmd = {
         let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(path);
+        c.args(["/C", "start", ""]).arg(url);
         c
     };
 
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
         let mut c = Command::new("xdg-open");
-        c.arg(path);
+        c.arg(url);
         c
     };
 
-    let status = cmd.status().context("failed to launch browser")?;
-    if !status.success() {
-        bail!("browser opener exited with {status}");
-    }
+    cmd.spawn().context("failed to launch browser")?;
     Ok(())
 }

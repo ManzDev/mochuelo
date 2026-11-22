@@ -57,7 +57,8 @@ Ctrl+C stops the server.
 - Cost card: total plus Input cost (Cached/Uncached with their token sizes) and
   Output cost (Uncached with its size; OpenCode has no output cache). The split is
   computed from per-message costs and the models.dev pricing catalog cached
-  locally by OpenCode.
+  locally by OpenCode. When the export records zero cost but tokens exist, the
+  total falls back to the catalog estimate.
 - User prompts rendered as Markdown, with attached files and mentions.
 - Assistant messages with collapsible reasoning blocks and tool calls.
 - Tool calls: input fields, output, error, exit code and completion status. Each

@@ -260,12 +260,19 @@ impl Stats {
             stats.cache_read = tokens.cache.as_ref().and_then(|c| c.read).unwrap_or(0);
             stats.cache_write = tokens.cache.as_ref().and_then(|c| c.write).unwrap_or(0);
         }
+        let (costs, complete) = crate::pricing::breakdown(export, pricing);
+        let recorded_cost = export.info.cost.unwrap_or(0.0);
         stats.cost = if sum_cost > 0.0 {
             sum_cost
+        } else if recorded_cost > 0.0 {
+            recorded_cost
+        } else if complete {
+            // OpenCode can leave info.cost and per-message costs at zero even
+            // when tokens were billed. Fall back to the catalog estimate.
+            costs.total()
         } else {
-            export.info.cost.unwrap_or(0.0)
+            0.0
         };
-        let (costs, complete) = crate::pricing::breakdown(export, pricing);
         stats.costs = costs;
         stats.cost_complete = complete;
         stats

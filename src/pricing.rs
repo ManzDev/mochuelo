@@ -24,6 +24,12 @@ pub struct Costs {
     pub output_uncached_tokens: u64,
 }
 
+impl Costs {
+    pub fn total(&self) -> f64 {
+        self.input_cached + self.input_uncached + self.output_uncached
+    }
+}
+
 pub struct Pricing {
     rates: HashMap<(String, String), Rates>,
 }

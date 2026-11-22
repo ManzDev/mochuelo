@@ -281,7 +281,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, screen: &Screen) 
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                "◈ oc-observe",
+                "◈ mochuelo",
                 Style::default()
                     .fg(ACCENT)
                     .add_modifier(Modifier::BOLD),

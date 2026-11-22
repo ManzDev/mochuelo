@@ -15,8 +15,6 @@ pub struct Info {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
     pub model: Option<Model>,
     #[serde(default)]
     pub cost: Option<f64>,

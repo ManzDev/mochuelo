@@ -1,4 +1,6 @@
+mod icons;
 mod model;
+mod pricing;
 mod render;
 mod server;
 mod sessions;
@@ -15,7 +17,7 @@ use model::Export;
 
 /// Inspect OpenCode sessions as a local web page.
 #[derive(Debug, Parser)]
-#[command(name = "oc-observe", version, about, long_about = None)]
+#[command(name = "mochuelo", version, about, long_about = None)]
 struct Cli {
     /// Session id (ses_...), a path to an exported .json file, or `-` for stdin.
     /// Omit it to pick a session interactively.

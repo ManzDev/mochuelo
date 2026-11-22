@@ -1,5 +1,5 @@
 [package]
-name = "oc-observe"
+name = "mochuelo"
 version = "0.1.0"
 edition = "2021"
 description = "Inspect OpenCode sessions as a local web page or standalone HTML"

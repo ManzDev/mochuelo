@@ -107,7 +107,7 @@ pub fn list_all() -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
-fn database_path() -> Option<PathBuf> {
+pub(crate) fn database_path() -> Option<PathBuf> {
     if let Some(path) = debug_db_path() {
         if path.is_file() {
             return Some(path);

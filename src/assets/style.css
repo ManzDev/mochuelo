@@ -24,7 +24,7 @@
   --bar-input-light: #ef4444;
   --bar-input-dark: #7f1d1d;
   --bar-output-light: #22c55e;
-  --bar-output-dark: #14532d;
+  --bar-output-dark: #15803d;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
@@ -452,20 +452,70 @@ a {
   background: var(--bar-assistant);
 }
 
-.meter-seg.uncached {
-  background: var(--bar-input-dark);
+.token-chart {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
 }
 
-.meter-seg.cached {
+.pie {
+  flex: none;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+}
+
+.pie-input {
+  background: conic-gradient(
+    var(--bar-input-light) var(--pie-pct),
+    var(--bar-input-dark) 0
+  );
+}
+
+.pie-output {
+  background: conic-gradient(
+    var(--bar-output-light) var(--pie-pct),
+    var(--bar-output-dark) 0
+  );
+}
+
+.token-legend {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 2px;
+}
+
+.dot-cached {
   background: var(--bar-input-light);
 }
 
-.meter-seg.output-uncached {
-  background: var(--bar-output-dark);
+.dot-uncached {
+  background: var(--bar-input-dark);
 }
 
-.meter-seg.output-cached {
+.dot-output {
   background: var(--bar-output-light);
+}
+
+.dot-reasoning {
+  background: var(--bar-output-dark);
 }
 
 /* --------------------------------------------------------------- toolbar */

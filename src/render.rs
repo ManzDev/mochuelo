@@ -309,51 +309,46 @@ impl Stats {
         } else {
             self.cache_read as f64 * 100.0 / total_input as f64
         };
-        let input_hint = format!(
-            "{} cached ({cached_pct:.1}%)\n{} uncached",
+        let input_legend = format!(
+            "<div class=\"legend-row\"><span class=\"legend-dot dot-cached\"></span><span>{} cached</span></div><div class=\"legend-row\"><span class=\"legend-dot dot-uncached\"></span><span>{} uncached</span></div>",
             fmt_compact(self.cache_read),
             fmt_compact(uncached_input)
         );
-        let input_bar = meter(
-            &[
-                ("cached", self.cache_read),
-                ("uncached", uncached_input),
-            ],
+        let input_card = token_card(
+            "total input tokens",
+            &fmt_compact(total_input),
+            "pie-input",
+            cached_pct,
             &format!(
-                "{} cached ({cached_pct:.1}%), {} uncached tokens",
-                fmt_compact(self.cache_read),
-                fmt_compact(uncached_input)
-            ),
-        );
-
-        let input_card = card_with_bar(
-            "total/uncached input",
-            &format!(
-                "{} / {}",
+                "{} input tokens: {cached_pct:.1}% cached, {:.1}% uncached",
                 fmt_compact(total_input),
-                fmt_compact(uncached_input)
+                100.0 - cached_pct
             ),
-            &input_hint,
-            &input_bar,
+            &input_legend,
         );
 
         let total_output = self.tokens_out + self.reasoning;
-        let output_hint = {
-            let mut hint = format!("{} output", fmt_compact(self.tokens_out));
-            if self.reasoning > 0 {
-                hint.push_str(&format!("\n{} reasoning", fmt_compact(self.reasoning)));
-            }
-            hint
+        let reasoning_pct = if total_output == 0 {
+            0.0
+        } else {
+            self.reasoning as f64 * 100.0 / total_output as f64
         };
-        let output_bar = meter(
-            &[("output-uncached", total_output)],
-            &format!("{} output tokens", fmt_compact(total_output)),
+        let output_legend = format!(
+            "<div class=\"legend-row\"><span class=\"legend-dot dot-output\"></span><span>{} output</span></div><div class=\"legend-row\"><span class=\"legend-dot dot-reasoning\"></span><span>{} reasoning</span></div>",
+            fmt_compact(self.tokens_out),
+            fmt_compact(self.reasoning)
         );
-        let output_card = card_with_bar(
-            "total output",
+        let output_card = token_card(
+            "total output tokens",
             &fmt_compact(total_output),
-            &output_hint,
-            &output_bar,
+            "pie-output",
+            reasoning_pct,
+            &format!(
+                "{} output tokens: {reasoning_pct:.1}% reasoning, {:.1}% non-reasoning",
+                fmt_compact(total_output),
+                100.0 - reasoning_pct
+            ),
+            &output_legend,
         );
 
         let _ = write!(
@@ -362,6 +357,23 @@ impl Stats {
         );
         out
     }
+}
+
+fn token_card(
+    label: &str,
+    value: &str,
+    pie_class: &str,
+    pie_pct: f64,
+    aria: &str,
+    legend: &str,
+) -> String {
+    format!(
+        "<div class=\"stat\"><div class=\"label\">{}</div><div class=\"value\">{}</div><div class=\"token-chart\"><div class=\"pie {pie_class}\" style=\"--pie-pct:{pie_pct:.2}%\" role=\"img\" aria-label=\"{}\" title=\"{}\"></div><div class=\"token-legend\">{legend}</div></div></div>",
+        esc(label),
+        esc(value),
+        esc(aria),
+        esc(aria)
+    )
 }
 
 fn meter(segments: &[(&str, u64)], aria: &str) -> String {

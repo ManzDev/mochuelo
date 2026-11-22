@@ -49,10 +49,10 @@ Ctrl+C stops the server.
   mascot embedded as a WebP data URI (no external image reference).
 - Stats: message count (user prompts / assistant messages on separate lines),
   tool calls with a per-tool count list, and a token fieldset with total/uncached
-  input (value shows total / uncached, hints show cached percentage then
-  uncached) and total output (total includes reasoning; hints show visible
-  output and reasoning). Token counts use compact units (K/M/B). Horizontal bars
-  show user vs assistant messages, cached vs uncached input, and output.
+  input (value shows total / uncached) and total output (total includes
+  reasoning). Each token card has a pie chart: cached vs uncached for input, and
+  reasoning vs non-reasoning for output. Token counts use compact units (K/M/B).
+  The messages card keeps a horizontal user/assistant bar.
   Stat values use Science Gothic (Google Fonts, with system fallback).
 - Cost card: total plus Input cost (Cached/Uncached with their token sizes) and
   Output cost (Uncached with its size; OpenCode has no output cache). The split is

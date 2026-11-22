@@ -179,6 +179,12 @@ fn push_chip(out: &mut String, label: &str, value: &str) {
     );
 }
 
+#[derive(Default, Clone, Copy)]
+struct ToolDetail {
+    count: usize,
+    cost: f64,
+}
+
 #[derive(Default)]
 struct Stats {
     messages: usize,
@@ -195,12 +201,18 @@ struct Stats {
     cost_complete: bool,
     tool_counts: HashMap<String, usize>,
     tool_costs: HashMap<String, f64>,
+    tool_details: HashMap<String, HashMap<String, ToolDetail>>,
 }
 
 impl Stats {
     fn collect(export: &Export, pricing: &crate::pricing::Pricing) -> Self {
         let mut stats = Stats::default();
         let mut sum_cost = 0.0_f64;
+        let project_dir = export
+            .info
+            .location
+            .as_ref()
+            .and_then(|location| location.directory.as_deref());
 
         for message in &export.messages {
             stats.messages += 1;
@@ -212,7 +224,15 @@ impl Stats {
             if message.kind != "assistant" {
                 continue;
             }
-            let mut tool_names: Vec<&str> = Vec::new();
+            let recorded = message.cost.unwrap_or(0.0);
+            let billable = if recorded > 0.0 {
+                recorded
+            } else {
+                crate::pricing::message_cost(message, export.info.model.as_ref(), pricing)
+                    .unwrap_or(0.0)
+            };
+
+            let mut tool_calls: Vec<(&str, Option<&Value>)> = Vec::new();
             for part in &message.content {
                 if part.get("type").and_then(Value::as_str) != Some("tool") {
                     continue;
@@ -222,20 +242,30 @@ impl Stats {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty())
                     .unwrap_or("unknown");
-                tool_names.push(name);
+                let input = part.get("state").and_then(|state| state.get("input"));
+                tool_calls.push((name, input));
             }
 
-            stats.tools += tool_names.len();
-            if !tool_names.is_empty() {
+            stats.tools += tool_calls.len();
+            if !tool_calls.is_empty() {
                 // Tool-level costs are not in the export: distribute the message
                 // cost evenly across its tool calls as an approximation.
-                let share = message.cost.unwrap_or(0.0) / tool_names.len() as f64;
-                for name in tool_names {
+                let share = billable / tool_calls.len() as f64;
+                for (name, input) in tool_calls {
                     *stats.tool_counts.entry(name.to_string()).or_insert(0) += 1;
                     *stats.tool_costs.entry(name.to_string()).or_insert(0.0) += share;
+
+                    let keys = tool_detail_keys(name, input, project_dir);
+                    let detail_share = share / keys.len() as f64;
+                    let details = stats.tool_details.entry(name.to_string()).or_default();
+                    for key in keys {
+                        let entry = details.entry(key).or_default();
+                        entry.count += 1;
+                        entry.cost += detail_share;
+                    }
                 }
             }
-            sum_cost += message.cost.unwrap_or(0.0);
+            sum_cost += billable;
             if let Some(tokens) = &message.tokens {
                 stats.tokens_in += tokens.input.unwrap_or(0);
                 stats.tokens_out += tokens.output.unwrap_or(0);
@@ -300,6 +330,7 @@ impl Stats {
             self.tools,
             &self.tool_counts,
             &self.tool_costs,
+            &self.tool_details,
         ));
         out.push_str(&cost_card(self.cost, &self.costs, self.cost_complete));
         let total_input = self.tokens_in + self.cache_read + self.cache_write;
@@ -406,6 +437,7 @@ fn tool_card(
     total: usize,
     counts: &HashMap<String, usize>,
     costs: &HashMap<String, f64>,
+    details: &HashMap<String, HashMap<String, ToolDetail>>,
 ) -> String {
     let mut items: Vec<(&String, &usize)> = counts.iter().collect();
     items.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -420,9 +452,37 @@ fn tool_card(
         for (name, count) in items {
             let icon = crate::icons::icon_id(name.as_str());
             let cost = costs.get(name.as_str()).copied().unwrap_or(0.0);
+
+            let mut detail_items: Vec<(&String, &ToolDetail)> = details
+                .get(name.as_str())
+                .map(|map| map.iter().collect())
+                .unwrap_or_default();
+            detail_items.sort_by(|a, b| {
+                b.1.cost
+                    .partial_cmp(&a.1.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.1.count.cmp(&a.1.count))
+                    .then_with(|| a.0.cmp(b.0))
+            });
+
+            let mut detail_html = String::new();
+            if !detail_items.is_empty() {
+                detail_html.push_str("<div class=\"tool-detail-list\">");
+                for (key, detail) in detail_items {
+                    let _ = write!(
+                        detail_html,
+                        "<div class=\"tool-detail-row\"><span class=\"tool-detail-key\" title=\"{}\">{}</span><span class=\"tool-detail-cost\">{}</span></div>",
+                        esc(key),
+                        esc(key),
+                        fmt_cost(detail.cost)
+                    );
+                }
+                detail_html.push_str("</div>");
+            }
+
             let _ = write!(
                 out,
-                "<div class=\"tool-row\"><span class=\"tool-item\"><svg class=\"tool-icon\" aria-hidden=\"true\"><use href=\"#icon-{icon}\"></use></svg><span class=\"tool-item-name\" title=\"{}\">{}</span></span><span class=\"tool-metrics\"><span class=\"tool-count\">({})</span><span class=\"tool-cost\">{}</span></span></div>",
+                "<details class=\"tool-breakdown\"><summary class=\"tool-row\"><span class=\"tool-item\"><svg class=\"tool-icon\" aria-hidden=\"true\"><use href=\"#icon-{icon}\"></use></svg><span class=\"tool-item-name\" title=\"{}\">{}</span></span><span class=\"tool-metrics\"><span class=\"tool-count\">({})</span><span class=\"tool-cost\">{}</span></span><span class=\"tool-chevron\" aria-hidden=\"true\">›</span></summary>{detail_html}</details>",
                 esc(name),
                 esc(name),
                 fmt_int(*count as u64),
@@ -433,6 +493,299 @@ fn tool_card(
     }
 
     out.push_str("</div>");
+    out
+}
+
+/// Human-facing grouping key for a tool call, used in the expandable cost
+/// breakdown. Shell calls group by primary command, edit/read/write by file,
+/// searches by query/pattern, etc.
+fn tool_detail_keys(name: &str, input: Option<&Value>, project_dir: Option<&str>) -> Vec<String> {
+    let keys = match name {
+        "shell" | "bash" => shell_detail_keys(input),
+        "edit" | "write" | "read" => input_str(input, &["filePath", "path"])
+            .map(|key| vec![relative_path(&key, project_dir)])
+            .unwrap_or_default(),
+        "glob" | "grep" => input_str(input, &["pattern", "path"])
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        "webfetch" => input_str(input, &["url"])
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        "websearch" => input_str(input, &["query"])
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        "execute" => execute_detail_keys(input),
+        "skill" => input_str(input, &["name", "skill"])
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        "subagent" => input_str(input, &["description", "agent", "name", "prompt"])
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        "question" => question_detail(input)
+            .map(|key| vec![key])
+            .unwrap_or_default(),
+        _ => input_str(
+            input,
+            &["description", "filePath", "path", "command", "name", "prompt"],
+        )
+        .map(|key| vec![key])
+        .unwrap_or_default(),
+    };
+
+    let keys = dedupe_keys(keys);
+    if keys.is_empty() {
+        vec![name.to_string()]
+    } else {
+        keys
+    }
+}
+
+fn input_str(input: Option<&Value>, fields: &[&str]) -> Option<String> {
+    let input = input?.as_object()?;
+    for field in fields {
+        if let Some(text) = input.get(*field).and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn relative_path(path: &str, project_dir: Option<&str>) -> String {
+    let Some(project_dir) = project_dir else {
+        return path.to_string();
+    };
+    match std::path::Path::new(path).strip_prefix(project_dir) {
+        Ok(relative) if !relative.as_os_str().is_empty() => {
+            relative.to_string_lossy().to_string()
+        }
+        _ => path.to_string(),
+    }
+}
+
+fn shell_detail_keys(input: Option<&Value>) -> Vec<String> {
+    let Some(command) = input_str(input, &["command"]) else {
+        return Vec::new();
+    };
+
+    let mut keys = Vec::new();
+    for segment in split_shell_segments(&command) {
+        if let Some(name) = segment_command_name(&segment) {
+            keys.push(name);
+        }
+    }
+    keys
+}
+
+fn split_shell_segments(command: &str) -> Vec<String> {
+    let command = strip_heredoc_bodies(command);
+    let chars: Vec<char> = command.chars().collect();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if escaped {
+            current.push(c);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            current.push(c);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            current.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        let separator = c == '\n'
+            || c == ';'
+            || c == '|'
+            || (c == '&' && i + 1 < chars.len() && chars[i + 1] == '&');
+        if separator {
+            if !current.trim().is_empty() {
+                segments.push(current.trim().to_string());
+            }
+            current.clear();
+            if (c == '|' || c == '&') && i + 1 < chars.len() && chars[i + 1] == c {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        current.push(c);
+        i += 1;
+    }
+
+    if !current.trim().is_empty() {
+        segments.push(current.trim().to_string());
+    }
+    segments
+}
+
+fn strip_heredoc_bodies(command: &str) -> String {
+    let mut out = String::new();
+    let mut heredoc: Option<String> = None;
+
+    for line in command.lines() {
+        if let Some(delimiter) = &heredoc {
+            if line.trim() == delimiter {
+                heredoc = None;
+            }
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+
+        if let Some(delimiter) = heredoc_delimiter(line) {
+            heredoc = Some(delimiter);
+        }
+    }
+
+    out
+}
+
+fn heredoc_delimiter(line: &str) -> Option<String> {
+    let index = line.find("<<")?;
+    let rest = &line[index + 2..];
+    if rest.starts_with('<') {
+        return None;
+    }
+
+    let rest = rest.trim_start_matches('-').trim_start();
+    let word: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&' | ')'))
+        .collect();
+    let word = word
+        .trim_matches(|c| matches!(c, '\'' | '"' | '`'))
+        .to_string();
+
+    if word.is_empty() {
+        None
+    } else {
+        Some(word)
+    }
+}
+
+fn segment_command_name(segment: &str) -> Option<String> {
+    for raw in segment.split_whitespace() {
+        let word = raw.trim_matches(|c: char| matches!(c, '(' | ')' | '{' | '}' | '!' | ';'));
+        if word.is_empty() || word.starts_with('#') {
+            continue;
+        }
+        if is_shell_assignment(word) {
+            continue;
+        }
+        if matches!(
+            word,
+            "cd" | "pushd" | "popd" | "export" | "unset" | "set"
+        ) {
+            return None;
+        }
+        if matches!(
+            word,
+            "for" | "do" | "done"
+                | "while"
+                | "until"
+                | "if"
+                | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "case"
+                | "esac"
+                | "function"
+                | "in"
+        ) {
+            return None;
+        }
+        if matches!(
+            word,
+            "sudo"
+                | "doas"
+                | "env"
+                | "time"
+                | "command"
+                | "exec"
+                | "nohup"
+                | "nice"
+                | "xargs"
+                | "watch"
+        ) {
+            continue;
+        }
+        let name = std::path::Path::new(word).file_name()?.to_string_lossy();
+        if name.is_empty() {
+            continue;
+        }
+        return Some(name.into_owned());
+    }
+    None
+}
+
+fn execute_detail_keys(input: Option<&Value>) -> Vec<String> {
+    let Some(code) = input_str(input, &["code"]) else {
+        return Vec::new();
+    };
+
+    let mut keys = Vec::new();
+    let mut rest = code.as_str();
+    while let Some(index) = rest.find("tools.") {
+        let after = &rest[index + "tools.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if name.is_empty() {
+            rest = after;
+        } else {
+            keys.push(name.clone());
+            rest = &after[name.len()..];
+        }
+    }
+    keys
+}
+
+fn question_detail(input: Option<&Value>) -> Option<String> {
+    let questions = input?.get("questions")?.as_array()?;
+    let first = questions.first()?;
+    first
+        .get("header")
+        .or_else(|| first.get("question"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn dedupe_keys(keys: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in keys {
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
     out
 }
 

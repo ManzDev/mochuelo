@@ -1,4 +1,4 @@
-use crate::model::Export;
+use crate::model::{Export, Message, Model};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
@@ -108,6 +108,34 @@ pub fn breakdown(export: &Export, pricing: &Pricing) -> (Costs, bool) {
     (costs, complete)
 }
 
+/// Cost of one assistant message using the catalog rates. Used when OpenCode
+/// did not record a per-message cost.
+pub fn message_cost(
+    message: &Message,
+    fallback_model: Option<&Model>,
+    pricing: &Pricing,
+) -> Option<f64> {
+    let tokens = message.tokens.as_ref()?;
+    let model = message.model.as_ref().or(fallback_model)?;
+    let provider = model.provider_id.as_deref()?;
+    let id = model.id.as_deref()?;
+    let rate = pricing.rate(provider, id)?;
+
+    let input = tokens.input.unwrap_or(0) as f64;
+    let output = (tokens.output.unwrap_or(0) + tokens.reasoning.unwrap_or(0)) as f64;
+    let cache = tokens.cache.as_ref();
+    let cache_read = cache.and_then(|c| c.read).unwrap_or(0) as f64;
+    let cache_write = cache.and_then(|c| c.write).unwrap_or(0) as f64;
+
+    Some(
+        (input * rate.input
+            + cache_read * rate.cache_read
+            + cache_write * rate.cache_write
+            + output * rate.output)
+            / 1_000_000.0,
+    )
+}
+
 fn used_models(export: &Export) -> HashSet<(String, String)> {
     let mut models = HashSet::new();
 
@@ -181,11 +209,11 @@ struct Catalog {
 #[derive(Deserialize)]
 struct Provider {
     #[serde(default)]
-    models: HashMap<String, Model>,
+    models: HashMap<String, CatalogModel>,
 }
 
 #[derive(Deserialize)]
-struct Model {
+struct CatalogModel {
     #[serde(default)]
     cost: Option<ModelCost>,
 }

@@ -65,7 +65,10 @@ Ctrl+C stops the server.
   tool has an inline SVG icon (unknown tools use the default `tool.svg`); all
   icons live in a sprite embedded at the top of the page, with no external files.
   The tool-call card lists each tool with its count and approximate cost (the
-  message cost is split evenly across its tool calls).
+  message cost is split evenly across its tool calls). Each tool is a
+  `<details>`: expanding it breaks the cost down by primary shell command,
+  edited/read file (relative to the project), search pattern/query, URL, executed
+  code tool, etc.
 - Shell `command` inputs get token-level syntax highlighting: commands, flags,
   strings, variables, operators/pipes and comments.
 - Markdown rendering (tables, lists, code blocks…), with raw HTML stripped.

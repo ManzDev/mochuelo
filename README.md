@@ -21,10 +21,26 @@ cargo install --git https://github.com/manzdev/mochuelo
 ## Usage
 
 ```sh
-mochuelo                  # interactive picker (↑/↓ or j/k, Enter, a, q)
+mochuelo                  # interactive picker; press s for global stats
 mochuelo <session-id>     # serve the session and open the browser
 mochuelo <session-id> -o report.html   # export into a standalone HTML report
 ```
+
+### Global statistics (TUI)
+
+Press `s` in the session picker to open aggregate usage:
+
+- `Tab` / `g` `m` `w` `d`: Global, Monthly, Weekly or Daily.
+- Submenu, oldest to newest: months (`June 2026` → `November 2026`),
+  weeks (`16N-22N`, Monday–Sunday) or days (`15/Nov` → `22/Nov`).
+- `←` / `→` (or `h` / `l`): previous / next month, week or day.
+- `-` / `+` (or `[` / `]`): older / newer page of the submenu.
+- `r`: reload.
+- `Esc`: back to sessions; `q`: quit.
+
+The view shows messages, total input tokens plus indented cached input
+(and percentage), output tokens, total input + output, cache multiplier, cost
+per 1M tokens, total cost and session duration for the selected period.
 
 ### Options
 
@@ -51,6 +67,7 @@ Ctrl+C stops the server.
 
 - Requires the `opencode` CLI installed in `PATH`.
 - Cost breakdown reads the cached models.dev catalog from the same database. If pricing is missing for a model, the card shows the total without the split.
+- Global statistics include all non-archived sessions. A session with zero recorded cost is estimated from its tokens and the cached pricing catalog.
 - Only data present in the export is shown; tool outputs are truncated at 120k characters per block to keep pages reasonable.
 - The server binds to `127.0.0.1` only.
 

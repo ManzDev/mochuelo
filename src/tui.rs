@@ -1,6 +1,8 @@
+use crate::pricing::Pricing;
 use crate::render;
 use crate::server::Server;
 use crate::sessions::{self, Session};
+use crate::stats::{self, GlobalStats, Period};
 use crate::{load_export, open_url};
 
 use anyhow::Result;
@@ -43,6 +45,7 @@ enum Screen {
     Error {
         message: String,
     },
+    Stats(StatsState),
 }
 
 struct App {
@@ -53,6 +56,98 @@ struct App {
     screen: Screen,
     running: bool,
     status: Option<String>,
+}
+
+struct StatsState {
+    period: Period,
+    offset: i64,
+    label: String,
+    data: GlobalStats,
+    error: Option<String>,
+    pricing: Pricing,
+}
+
+impl StatsState {
+    fn new() -> Self {
+        let mut state = Self {
+            period: Period::Global,
+            offset: 0,
+            label: String::new(),
+            data: GlobalStats::default(),
+            error: None,
+            pricing: Pricing::load_all(),
+        };
+        state.reload();
+        state
+    }
+
+    fn reload(&mut self) {
+        match stats::load(self.period, self.offset, &self.pricing) {
+            Ok((label, data)) => {
+                self.label = label;
+                self.data = data;
+                self.error = None;
+            }
+            Err(err) => {
+                self.label.clear();
+                self.data = GlobalStats::default();
+                self.error = Some(format!("{err:#}"));
+            }
+        }
+    }
+
+    fn set_period(&mut self, period: Period) {
+        self.period = period;
+        self.offset = 0;
+        self.reload();
+    }
+
+    fn page_size(&self) -> i64 {
+        match self.period {
+            Period::Global => 1,
+            Period::Monthly => 6,
+            Period::Weekly => 5,
+            Period::Daily => 8,
+        }
+    }
+
+    fn page(&self) -> i64 {
+        self.offset / self.page_size()
+    }
+
+    fn older_page(&mut self) {
+        if self.period == Period::Global {
+            return;
+        }
+        self.offset = (self.page() + 1) * self.page_size();
+        self.reload();
+    }
+
+    fn newer_page(&mut self) {
+        if self.period == Period::Global {
+            return;
+        }
+        let page = self.page();
+        if page > 0 {
+            self.offset = (page - 1) * self.page_size();
+            self.reload();
+        }
+    }
+
+    fn step(&mut self, newer: bool) {
+        if self.period == Period::Global {
+            return;
+        }
+        if newer {
+            if self.offset > 0 {
+                self.offset -= 1;
+                self.reload();
+            }
+        } else {
+            self.offset = self.offset.saturating_add(1);
+            self.reload();
+        }
+    }
 }
 
 impl App {
@@ -105,9 +200,6 @@ impl App {
 /// Run the interactive session picker.
 pub fn run(port: u16, open: bool) -> Result<()> {
     let sessions = sessions::list()?;
-    if sessions.is_empty() {
-        anyhow::bail!("no OpenCode sessions found for this project");
-    }
 
     let mut term = Term::new()?;
     let mut app = App {
@@ -152,6 +244,43 @@ fn handle_key(
         return Ok(());
     }
 
+    if matches!(app.screen, Screen::Stats(_)) {
+        let mut back = false;
+        let mut quit = false;
+
+        if let Screen::Stats(state) = &mut app.screen {
+            match code {
+                KeyCode::Esc => back = true,
+                KeyCode::Char('q') => quit = true,
+                KeyCode::Tab => {
+                    let next = state.period.next();
+                    state.set_period(next);
+                }
+                KeyCode::BackTab => {
+                    let previous = state.period.previous();
+                    state.set_period(previous);
+                }
+                KeyCode::Char('g') => state.set_period(Period::Global),
+                KeyCode::Char('m') => state.set_period(Period::Monthly),
+                KeyCode::Char('w') => state.set_period(Period::Weekly),
+                KeyCode::Char('d') => state.set_period(Period::Daily),
+                KeyCode::Left | KeyCode::Char('h') => state.step(false),
+                KeyCode::Right | KeyCode::Char('l') => state.step(true),
+                KeyCode::Char('[') | KeyCode::Char('-') => state.older_page(),
+                KeyCode::Char(']') | KeyCode::Char('+') => state.newer_page(),
+                KeyCode::Char('r') => state.reload(),
+                _ => {}
+            }
+        }
+
+        if quit {
+            app.running = false;
+        } else if back {
+            app.screen = Screen::List;
+        }
+        return Ok(());
+    }
+
     match &app.screen {
         Screen::List => match code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -167,6 +296,7 @@ fn handle_key(
                 app.selected = app.sessions().len().saturating_sub(1);
             }
             KeyCode::Char('a') => app.toggle_scope(),
+            KeyCode::Char('s') => app.screen = Screen::Stats(StatsState::new()),
             KeyCode::Enter => start_selected(app, port, open, term)?,
             KeyCode::Esc | KeyCode::Char('q') => app.running = false,
             _ => {}
@@ -186,6 +316,7 @@ fn handle_key(
             _ => app.screen = Screen::List,
         },
         Screen::Loading { .. } => {}
+        Screen::Stats(_) => {}
     }
 
     Ok(())
@@ -265,6 +396,7 @@ fn draw(frame: &mut Frame, app: &App) {
             ..
         } => draw_serving(frame, chunks[1], title, id, directory, url),
         Screen::Error { message } => draw_error(frame, chunks[1], message),
+        Screen::Stats(state) => draw_stats(frame, chunks[1], state),
     }
 
     draw_footer(frame, chunks[2], app);
@@ -276,6 +408,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, screen: &Screen) 
         Screen::Loading { .. } => "Preparing session…",
         Screen::Serving { .. } => "Session is being served locally",
         Screen::Error { .. } => "Something went wrong",
+        Screen::Stats(_) => "Usage statistics",
     };
 
     let lines = vec![
@@ -315,6 +448,8 @@ fn draw_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             } else {
                 " all projects   "
             }),
+            key("s"),
+            plain(" stats   "),
             key("q"),
             plain(" quit"),
         ],
@@ -330,6 +465,20 @@ fn draw_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         Screen::Error { .. } => vec![
             key("any key"),
             plain(" back to list   "),
+            key("q"),
+            plain(" quit"),
+        ],
+        Screen::Stats(_) => vec![
+            key("Tab"),
+            plain(" mode   "),
+            key("←/→"),
+            plain(" period   "),
+            key("-/+"),
+            plain(" page   "),
+            key("g/m/w/d"),
+            plain(" jump   "),
+            key("Esc"),
+            plain(" back   "),
             key("q"),
             plain(" quit"),
         ],
@@ -349,8 +498,7 @@ fn draw_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_widget(footer, area);
 }
 
-fn draw_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let rows = app.sessions().iter().map(|session| {
+fn draw_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {    let rows = app.sessions().iter().map(|session| {
         Row::new(vec![
             Cell::from(session.id.clone()).style(Style::default().fg(FAINT)),
             Cell::from(session.title().to_string()).style(Style::default().fg(TEXT)),
@@ -398,6 +546,162 @@ fn draw_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let mut state = TableState::default();
     state.select(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn draw_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &StatsState) {
+    let chunks = Layout::vertical([Constraint::Length(5), Constraint::Min(6)]).split(area);
+
+    let mut tabs = Vec::new();
+    for (index, period) in Period::ALL.iter().enumerate() {
+        if index > 0 {
+            tabs.push(Span::styled("   ", Style::default().fg(FAINT)));
+        }
+        let selected = *period == state.period;
+        let style = if selected {
+            Style::default()
+                .bg(HIGHLIGHT_BG)
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        tabs.push(Span::styled(format!(" {} ", period.label()), style));
+    }
+
+    let mut submenu = Vec::new();
+    if state.period != Period::Global {
+        let page = state.page();
+        submenu.push(pager("[-]", true));
+        submenu.push(Span::styled("  ", Style::default().fg(FAINT)));
+
+        let size = state.page_size();
+        let page_start = page * size;
+        let mut first = true;
+        for index in (0..size).rev() {
+            let offset = page_start + index;
+            if !first {
+                submenu.push(Span::styled("  ", Style::default().fg(FAINT)));
+            }
+            first = false;
+            if let Some(range) = state.period.range(offset) {
+                let selected = offset == state.offset;
+                let style = if selected {
+                    Style::default()
+                        .bg(HIGHLIGHT_BG)
+                        .fg(TEXT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                };
+                submenu.push(Span::styled(range.short_label, style));
+            }
+        }
+
+        submenu.push(Span::styled("  ", Style::default().fg(FAINT)));
+        submenu.push(pager("[+]", page > 0));
+    }
+
+    let header = Paragraph::new(vec![
+        Line::from(tabs),
+        Line::from(submenu),
+        Line::from(Span::styled(
+            state.label.clone(),
+            Style::default().fg(ACCENT2),
+        )),
+    ]);
+    frame.render_widget(header, chunks[0]);
+
+    if let Some(error) = &state.error {
+        let paragraph = Paragraph::new(Span::styled(error.clone(), Style::default().fg(ERR)))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ERR))
+                    .title(Span::styled(" usage ", Style::default().fg(ERR))),
+            );
+        frame.render_widget(paragraph, chunks[1]);
+        return;
+    }
+
+    let stats = &state.data;
+    let multiplier = match stats.cache_multiplier() {
+        Some(value) => format!("x{value:.1}"),
+        None => "—".to_string(),
+    };
+    let cached_pct = if stats.input_total == 0 {
+        0.0
+    } else {
+        stats.cached_input as f64 * 100.0 / stats.input_total as f64
+    };
+
+    let rows = vec![
+        stat_row("messages", render::fmt_int(stats.messages)),
+        stat_row("input tokens", render::fmt_compact(stats.input_total)),
+        stat_sub_row(
+            "cached input",
+            format!(
+                "{} ({cached_pct:.1}%)",
+                render::fmt_compact(stats.cached_input)
+            ),
+        ),
+        stat_row(
+            "output tokens",
+            render::fmt_compact(stats.output_total),
+        ),
+        stat_row(
+            "total (input + output)",
+            render::fmt_compact(stats.total_tokens()),
+        ),
+        stat_row("cache multiplier", multiplier),
+        stat_row(
+            "cost / 1M tokens",
+            render::fmt_cost(stats.cost_per_million()),
+        ),
+        stat_row("total cost", render::fmt_cost(stats.cost)),
+        stat_row(
+            "session duration",
+            render::fmt_duration(stats.duration_ms),
+        ),
+        stat_row("sessions", render::fmt_int(stats.sessions)),
+    ];
+
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)])
+        .column_spacing(2)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER))
+                .title(Span::styled(" usage ", Style::default().fg(MUTED))),
+        );
+    frame.render_widget(table, chunks[1]);
+}
+
+fn pager(label: &str, enabled: bool) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        if enabled {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(BORDER)
+        },
+    )
+}
+
+fn stat_row(label: &str, value: String) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(label.to_string()).style(Style::default().fg(FAINT)),
+        Cell::from(value).style(Style::default().fg(TEXT)),
+    ])
+}
+
+fn stat_sub_row(label: &str, value: String) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(format!("  {label}")).style(Style::default().fg(BORDER)),
+        Cell::from(value).style(Style::default().fg(FAINT)),
+    ])
 }
 
 fn draw_loading(frame: &mut Frame, area: ratatui::layout::Rect, title: &str) {

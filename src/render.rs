@@ -1558,7 +1558,7 @@ fn fmt_ts(ms: i64) -> String {
     }
 }
 
-fn fmt_duration(ms: i64) -> String {
+pub(crate) fn fmt_duration(ms: i64) -> String {
     let ms = ms.max(0);
     if ms < 1_000 {
         format!("{ms} ms")
@@ -1575,13 +1575,20 @@ fn fmt_duration(ms: i64) -> String {
     } else {
         let hours = ms / 3_600_000;
         let minutes = (ms % 3_600_000) / 60_000;
-        format!("{hours}h {minutes}m")
+        let days = hours / 24;
+        if days > 0 {
+            format!("{days}d {}h", hours % 24)
+        } else {
+            format!("{hours}h {minutes}m")
+        }
     }
 }
 
-fn fmt_cost(cost: f64) -> String {
+pub(crate) fn fmt_cost(cost: f64) -> String {
     if cost <= 0.0 {
         "$0.00".to_string()
+    } else if cost < 0.0001 {
+        format!("${cost:.6}")
     } else if cost < 0.01 {
         format!("${cost:.4}")
     } else if cost < 1.0 {
@@ -1591,7 +1598,7 @@ fn fmt_cost(cost: f64) -> String {
     }
 }
 
-fn fmt_int(value: u64) -> String {
+pub(crate) fn fmt_int(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (idx, ch) in digits.chars().enumerate() {
@@ -1604,7 +1611,7 @@ fn fmt_int(value: u64) -> String {
 }
 
 /// Compact token counts: 1.2B, 23.4M, 35K, 272.
-fn fmt_compact(value: u64) -> String {
+pub(crate) fn fmt_compact(value: u64) -> String {
     if value >= 1_000_000_000 {
         compact(value, 1_000_000_000, "B")
     } else if value >= 1_000_000 {

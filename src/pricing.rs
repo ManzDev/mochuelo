@@ -49,6 +49,34 @@ impl Pricing {
         Self { rates }
     }
 
+    /// Load every rate in the cached models.dev catalog. Used by the global
+    /// statistics view, where sessions can use many different models.
+    pub fn load_all() -> Self {
+        Self {
+            rates: load_all_rates().unwrap_or_default(),
+        }
+    }
+
+    /// Estimate cost for arbitrary token counts (USD per million token rates).
+    pub fn estimate(
+        &self,
+        provider: &str,
+        model: &str,
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        output: u64,
+    ) -> Option<f64> {
+        let rate = self.rate(provider, model)?;
+        Some(
+            (input as f64 * rate.input
+                + cache_read as f64 * rate.cache_read
+                + cache_write as f64 * rate.cache_write
+                + output as f64 * rate.output)
+                / 1_000_000.0,
+        )
+    }
+
     fn rate(&self, provider: &str, model: &str) -> Option<Rates> {
         self.rates
             .get(&(provider.to_string(), model.to_string()))
@@ -162,25 +190,7 @@ fn used_models(export: &Export) -> HashSet<(String, String)> {
 fn load_rates(
     needed: &HashSet<(String, String)>,
 ) -> Result<HashMap<(String, String), Rates>> {
-    let path = crate::sessions::database_path()
-        .context("could not locate the OpenCode database for model pricing")?;
-
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("failed to open {} read-only", path.display()))?;
-    conn.busy_timeout(Duration::from_millis(800))?;
-
-    let raw: String = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key = 'models-dev:v2:catalog'",
-            [],
-            |row| row.get(0),
-        )
-        .context("models.dev catalog not cached by OpenCode")?;
-    let catalog: Catalog = serde_json::from_str(&raw)
-        .context("failed to parse the cached models.dev catalog")?;
-
-    let body: HashMap<String, Provider> = serde_json::from_str(&catalog.body)
-        .context("failed to parse the models.dev catalog body")?;
+    let body = catalog_body()?;
 
     let mut out = HashMap::new();
     for (provider_id, model_id) in needed {
@@ -199,6 +209,45 @@ fn load_rates(
     }
 
     Ok(out)
+}
+
+fn load_all_rates() -> Result<HashMap<(String, String), Rates>> {
+    let body = catalog_body()?;
+    let mut out = HashMap::new();
+
+    for (provider_id, provider) in &body {
+        for (model_id, model) in &provider.models {
+            let Some(cost) = model.cost.as_ref().and_then(|cost| cost.text.as_ref()) else {
+                continue;
+            };
+            if let Some(rates) = Rates::from_cost(cost) {
+                out.insert((provider_id.clone(), model_id.clone()), rates);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn catalog_body() -> Result<HashMap<String, Provider>> {
+    let path = crate::sessions::database_path()
+        .context("could not locate the OpenCode database for model pricing")?;
+
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+    conn.busy_timeout(Duration::from_millis(800))?;
+
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM kv WHERE key = 'models-dev:v2:catalog'",
+            [],
+            |row| row.get(0),
+        )
+        .context("models.dev catalog not cached by OpenCode")?;
+    let catalog: Catalog = serde_json::from_str(&raw)
+        .context("failed to parse the cached models.dev catalog")?;
+
+    serde_json::from_str(&catalog.body).context("failed to parse the models.dev catalog body")
 }
 
 #[derive(Deserialize)]

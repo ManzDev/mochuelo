@@ -4,6 +4,7 @@ mod pricing;
 mod render;
 mod server;
 mod sessions;
+mod stats;
 mod tui;
 
 use anyhow::{bail, Context, Result};

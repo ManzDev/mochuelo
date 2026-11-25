@@ -38,9 +38,20 @@ Press `s` in the session picker to open aggregate usage:
 - `r`: reload.
 - `Esc`: back to sessions; `q`: quit.
 
-The view shows messages, total input tokens plus indented cached input
-(and percentage), output tokens, total input + output, cache multiplier, cost
-per 1M tokens, total cost and session duration for the selected period.
+The view shows total input + output first, then input tokens with nested cached
+input and uncached input (both with percentage), output tokens, messages, cache
+multiplier, total cost (with cost/1M in parentheses), active session duration
+and session count.
+
+Statistics are aggregated per message by its own timestamp, so a session that
+spans several days contributes each day only its own tokens, cost and messages.
+Session duration is active time: gaps between consecutive user/assistant
+messages, with pauses longer than 5 minutes capped at 5 minutes.
+
+Monthly, Weekly and Daily views also show an `activity` panel above usage: a
+contribution grid of squares, one per month/week/day, shaded darker for less
+total tokens and lighter for more. There are no labels or legend; the selected
+period is marked with yellow brackets. Global has no activity grid.
 
 ### Options
 

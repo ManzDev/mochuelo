@@ -1,9 +1,13 @@
 use crate::pricing::Pricing;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
+
+/// Gaps longer than this between messages are treated as inactivity and capped.
+const IDLE_GAP_CAP_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Period {
@@ -116,6 +120,192 @@ pub struct PeriodRange {
     pub end: Option<i64>,
 }
 
+pub struct ActivityBucket {
+    pub offset: i64,
+    pub tokens: u64,
+}
+
+impl Period {
+    fn activity_cap(self) -> i64 {
+        match self {
+            Period::Global => 0,
+            Period::Monthly => 24,
+            Period::Weekly => 52,
+            Period::Daily => 90,
+        }
+    }
+
+    fn bucket_count(self, oldest: NaiveDate, today: NaiveDate) -> i64 {
+        match self {
+            Period::Global => 0,
+            Period::Monthly => {
+                let oldest_index = oldest.year() * 12 + oldest.month0() as i32;
+                let today_index = today.year() * 12 + today.month0() as i32;
+                (today_index - oldest_index + 1) as i64
+            }
+            Period::Weekly => {
+                let oldest_monday =
+                    oldest - Duration::days(oldest.weekday().num_days_from_monday() as i64);
+                let today_monday =
+                    today - Duration::days(today.weekday().num_days_from_monday() as i64);
+                ((today_monday - oldest_monday).num_days() / 7 + 1) as i64
+            }
+            Period::Daily => (today - oldest).num_days() + 1,
+        }
+    }
+}
+
+fn open_database() -> Result<Connection> {
+    let path = crate::sessions::database_path()
+        .context("could not locate the OpenCode database")?;
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+    conn.busy_timeout(StdDuration::from_millis(800))?;
+    Ok(conn)
+}
+
+struct MessageRow {
+    session_id: String,
+    time: i64,
+    previous: Option<i64>,
+    /// User and assistant rows delimit real activity; idle/system events do not.
+    timed: bool,
+    tokens: Option<MessageTokens>,
+    cost: Option<f64>,
+    model: Option<MessageModel>,
+}
+
+#[derive(Deserialize)]
+struct MessageModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "providerID")]
+    provider_id: Option<String>,
+}
+
+#[derive(Default)]
+struct MessageTokens {
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+impl MessageTokens {
+    fn total(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write + self.output + self.reasoning
+    }
+}
+
+/// Loads every message once, extracting only the fields used by the stats view.
+/// Parsing the full JSON payload would be slow: message content can be huge.
+fn load_message_rows(conn: &Connection) -> Result<Vec<MessageRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT sm.session_id, sm.type, sm.time_created,
+                LAG(sm.time_created) OVER (PARTITION BY sm.session_id ORDER BY sm.seq),
+                json_extract(sm.data, '$.tokens.input'),
+                json_extract(sm.data, '$.tokens.output'),
+                json_extract(sm.data, '$.tokens.reasoning'),
+                json_extract(sm.data, '$.tokens.cache.read'),
+                json_extract(sm.data, '$.tokens.cache.write'),
+                json_extract(sm.data, '$.cost'),
+                json_extract(sm.data, '$.model.id'),
+                json_extract(sm.data, '$.model.providerID')
+         FROM session_message sm
+         JOIN session_v2 s ON s.id = sm.session_id
+         WHERE s.time_archived IS NULL
+         ORDER BY sm.session_id, sm.seq",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let kind: String = row.get(1)?;
+        let tokens = if kind == "assistant" {
+            Some(MessageTokens {
+                input: row.get::<_, Option<u64>>(4)?.unwrap_or(0),
+                output: row.get::<_, Option<u64>>(5)?.unwrap_or(0),
+                reasoning: row.get::<_, Option<u64>>(6)?.unwrap_or(0),
+                cache_read: row.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                cache_write: row.get::<_, Option<u64>>(8)?.unwrap_or(0),
+            })
+        } else {
+            None
+        };
+        let model = match (row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?) {
+            (None, None) => None,
+            (id, provider_id) => Some(MessageModel { id, provider_id }),
+        };
+
+        Ok(MessageRow {
+            session_id: row.get(0)?,
+            time: row.get(2)?,
+            previous: row.get(3)?,
+            timed: kind == "user" || kind == "assistant",
+            tokens,
+            cost: row.get(9)?,
+            model,
+        })
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+fn activity_from_rows(period: Period, rows: &[MessageRow]) -> Vec<ActivityBucket> {
+    if period == Period::Global || rows.is_empty() {
+        return Vec::new();
+    }
+
+    let today = Local::now().date_naive();
+    let oldest = rows
+        .iter()
+        .map(|row| row.time)
+        .min()
+        .unwrap_or_else(|| Local::now().timestamp_millis());
+    let oldest_date = Local
+        .timestamp_millis_opt(oldest)
+        .single()
+        .map(|time| time.date_naive())
+        .unwrap_or(today);
+    let count = period.bucket_count(oldest_date, today);
+    if count <= 0 {
+        return Vec::new();
+    }
+
+    let cap = period.activity_cap();
+    let max_offset = (count - 1).min(cap - 1);
+    let mut values = Vec::new();
+
+    for offset in (0..=max_offset).rev() {
+        let Some(range) = period.range(offset) else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (range.start, range.end) else {
+            continue;
+        };
+
+        let tokens: u64 = rows
+            .iter()
+            .filter(|row| row.time >= start && row.time < end)
+            .filter_map(|row| row.tokens.as_ref())
+            .map(MessageTokens::total)
+            .sum();
+        values.push(ActivityBucket { offset, tokens });
+    }
+
+    values
+}
+
+fn in_range(start: Option<i64>, end: Option<i64>, time: i64) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => time >= start && time < end,
+        _ => true,
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct GlobalStats {
     pub sessions: u64,
@@ -156,121 +346,71 @@ impl GlobalStats {
     }
 }
 
-/// Aggregate usage for all sessions in the selected period.
+/// Aggregate usage for all messages created in the selected period.
 pub fn load(
     period: Period,
     offset: i64,
     pricing: &Pricing,
-) -> Result<(String, GlobalStats)> {
+) -> Result<(String, GlobalStats, Vec<ActivityBucket>)> {
     let range = period.range(offset).context("invalid period")?;
-    let path = crate::sessions::database_path()
-        .context("could not locate the OpenCode database")?;
-
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("failed to open {} read-only", path.display()))?;
-    conn.busy_timeout(StdDuration::from_millis(800))?;
+    let conn = open_database()?;
+    let rows = load_message_rows(&conn)?;
 
     let mut stats = GlobalStats::default();
-    let mut stmt = conn.prepare(
-        "SELECT model, cost, tokens_input, tokens_output, tokens_reasoning,
-                tokens_cache_read, tokens_cache_write, time_updated - time_created
-         FROM session_v2
-         WHERE time_archived IS NULL
-           AND (?1 IS NULL OR (time_created >= ?1 AND time_created < ?2))",
-    )?;
+    let mut sessions = HashSet::new();
 
-    let rows = stmt.query_map(params![range.start, range.end], |row| {
-        Ok(SessionRow {
-            model: row.get(0)?,
-            cost: row.get(1)?,
-            input: row.get(2)?,
-            output: row.get(3)?,
-            reasoning: row.get(4)?,
-            cache_read: row.get(5)?,
-            cache_write: row.get(6)?,
-            duration: row.get(7)?,
-        })
-    })?;
+    for row in &rows {
+        if !in_range(range.start, range.end, row.time) {
+            continue;
+        }
 
-    for row in rows {
-        let row = row?;
-        let input = row.input.unwrap_or(0).max(0) as u64;
-        let output = row.output.unwrap_or(0).max(0) as u64;
-        let reasoning = row.reasoning.unwrap_or(0).max(0) as u64;
-        let cache_read = row.cache_read.unwrap_or(0).max(0) as u64;
-        let cache_write = row.cache_write.unwrap_or(0).max(0) as u64;
+        stats.messages += 1;
+        sessions.insert(row.session_id.as_str());
 
-        stats.sessions += 1;
-        stats.input_total += input + cache_read + cache_write;
-        stats.cached_input += cache_read + cache_write;
-        stats.output_total += output + reasoning;
-        stats.duration_ms += row.duration.unwrap_or(0).max(0);
+        if row.timed {
+            if let Some(previous) = row.previous {
+                let gap = row.time - previous;
+                if gap > 0 {
+                    stats.duration_ms += gap.min(IDLE_GAP_CAP_MS);
+                }
+            }
+        }
 
-        let recorded = row.cost.unwrap_or(0.0);
-        stats.cost += if recorded > 0.0 {
-            recorded
-        } else {
-            estimate_session_cost(
-                row.model.as_deref(),
-                input,
-                cache_read,
-                cache_write,
-                output + reasoning,
-                pricing,
-            )
-            .unwrap_or(0.0)
+        let Some(tokens) = &row.tokens else {
+            continue;
+        };
+
+        stats.input_total += tokens.input + tokens.cache_read + tokens.cache_write;
+        stats.cached_input += tokens.cache_read + tokens.cache_write;
+        stats.output_total += tokens.output + tokens.reasoning;
+
+        stats.cost += match row.cost {
+            Some(recorded) if recorded > 0.0 => recorded,
+            _ => {
+                estimate_message_cost(row.model.as_ref(), tokens, pricing).unwrap_or(0.0)
+            }
         };
     }
 
-    stats.messages = conn.query_row(
-        "SELECT COUNT(*)
-         FROM session_message
-         WHERE session_id IN (
-             SELECT id FROM session_v2
-             WHERE time_archived IS NULL
-               AND (?1 IS NULL OR (time_created >= ?1 AND time_created < ?2))
-         )",
-        params![range.start, range.end],
-        |row| row.get::<_, i64>(0),
-    )? as u64;
+    stats.sessions = sessions.len() as u64;
+    let activity = activity_from_rows(period, &rows);
 
-    Ok((range.label, stats))
+    Ok((range.label, stats, activity))
 }
 
-struct SessionRow {
-    model: Option<String>,
-    cost: Option<f64>,
-    input: Option<i64>,
-    output: Option<i64>,
-    reasoning: Option<i64>,
-    cache_read: Option<i64>,
-    cache_write: Option<i64>,
-    duration: Option<i64>,
-}
-
-fn estimate_session_cost(
-    model: Option<&str>,
-    input: u64,
-    cache_read: u64,
-    cache_write: u64,
-    output: u64,
+fn estimate_message_cost(
+    model: Option<&MessageModel>,
+    tokens: &MessageTokens,
     pricing: &Pricing,
 ) -> Option<f64> {
-    #[derive(Deserialize)]
-    struct SessionModel {
-        id: Option<String>,
-        #[serde(rename = "providerID")]
-        provider_id: Option<String>,
-    }
-
-    let model: SessionModel = serde_json::from_str(model?).ok()?;
+    let model = model?;
     pricing.estimate(
         model.provider_id.as_deref()?,
         model.id.as_deref()?,
-        input,
-        cache_read,
-        cache_write,
-        output,
+        tokens.input,
+        tokens.cache_read,
+        tokens.cache_write,
+        tokens.output + tokens.reasoning,
     )
 }
 

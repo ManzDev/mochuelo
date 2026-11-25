@@ -2,7 +2,7 @@ use crate::pricing::Pricing;
 use crate::render;
 use crate::server::Server;
 use crate::sessions::{self, Session};
-use crate::stats::{self, GlobalStats, Period};
+use crate::stats::{self, ActivityBucket, GlobalStats, Period};
 use crate::{load_export, open_url};
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
@@ -30,6 +30,8 @@ const ACCENT: Color = Color::Rgb(138, 164, 255);
 const ACCENT2: Color = Color::Rgb(90, 209, 192);
 const ERR: Color = Color::Rgb(248, 113, 113);
 const HIGHLIGHT_BG: Color = Color::Rgb(32, 42, 66);
+const SUBTLE: Color = Color::Rgb(75, 85, 104);
+const YELLOW: Color = Color::Rgb(250, 204, 21);
 
 enum Screen {
     List,
@@ -63,6 +65,7 @@ struct StatsState {
     offset: i64,
     label: String,
     data: GlobalStats,
+    activity: Vec<ActivityBucket>,
     error: Option<String>,
     pricing: Pricing,
 }
@@ -74,6 +77,7 @@ impl StatsState {
             offset: 0,
             label: String::new(),
             data: GlobalStats::default(),
+            activity: Vec::new(),
             error: None,
             pricing: Pricing::load_all(),
         };
@@ -83,14 +87,16 @@ impl StatsState {
 
     fn reload(&mut self) {
         match stats::load(self.period, self.offset, &self.pricing) {
-            Ok((label, data)) => {
+            Ok((label, data, activity)) => {
                 self.label = label;
                 self.data = data;
+                self.activity = activity;
                 self.error = None;
             }
             Err(err) => {
                 self.label.clear();
                 self.data = GlobalStats::default();
+                self.activity.clear();
                 self.error = Some(format!("{err:#}"));
             }
         }
@@ -625,6 +631,8 @@ fn draw_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &StatsState
         return;
     }
 
+    let body = Layout::vertical([Constraint::Min(5), Constraint::Length(12)]).split(chunks[1]);
+
     let stats = &state.data;
     let multiplier = match stats.cache_multiplier() {
         Some(value) => format!("x{value:.1}"),
@@ -635,31 +643,54 @@ fn draw_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &StatsState
     } else {
         stats.cached_input as f64 * 100.0 / stats.input_total as f64
     };
+    let uncached_input = stats.input_total.saturating_sub(stats.cached_input);
+    let uncached_pct = if stats.input_total == 0 {
+        0.0
+    } else {
+        uncached_input as f64 * 100.0 / stats.input_total as f64
+    };
 
     let rows = vec![
-        stat_row("messages", render::fmt_int(stats.messages)),
-        stat_row("input tokens", render::fmt_compact(stats.input_total)),
+        stat_row(
+            "total (input + output)",
+            render::fmt_compact(stats.total_tokens()),
+        ),
+        stat_indent_row(
+            "├ input tokens",
+            render::fmt_compact(stats.input_total),
+            0,
+        ),
         stat_sub_row(
+            "│ ├",
             "cached input",
             format!(
                 "{} ({cached_pct:.1}%)",
                 render::fmt_compact(stats.cached_input)
             ),
         ),
-        stat_row(
-            "output tokens",
+        stat_sub_row(
+            "│ └",
+            "uncached input",
+            format!(
+                "{} ({uncached_pct:.1}%)",
+                render::fmt_compact(uncached_input)
+            ),
+        ),
+        stat_indent_row(
+            "└ output tokens",
             render::fmt_compact(stats.output_total),
+            0,
         ),
-        stat_row(
-            "total (input + output)",
-            render::fmt_compact(stats.total_tokens()),
-        ),
+        stat_row("messages", render::fmt_int(stats.messages)),
         stat_row("cache multiplier", multiplier),
         stat_row(
-            "cost / 1M tokens",
-            render::fmt_cost(stats.cost_per_million()),
+            "total cost",
+            format!(
+                "{} ({} cost/1M)",
+                render::fmt_cost(stats.cost),
+                render::fmt_cost(stats.cost_per_million())
+            ),
         ),
-        stat_row("total cost", render::fmt_cost(stats.cost)),
         stat_row(
             "session duration",
             render::fmt_duration(stats.duration_ms),
@@ -676,7 +707,8 @@ fn draw_stats(frame: &mut Frame, area: ratatui::layout::Rect, state: &StatsState
                 .border_style(Style::default().fg(BORDER))
                 .title(Span::styled(" usage ", Style::default().fg(MUTED))),
         );
-    frame.render_widget(table, chunks[1]);
+    draw_activity(frame, body[0], state);
+    frame.render_widget(table, body[1]);
 }
 
 fn pager(label: &str, enabled: bool) -> Span<'static> {
@@ -691,18 +723,92 @@ fn pager(label: &str, enabled: bool) -> Span<'static> {
 }
 
 fn stat_row(label: &str, value: String) -> Row<'static> {
+    stat_indent_row(label, value, 0)
+}
+
+fn stat_indent_row(label: &str, value: String, indent: usize) -> Row<'static> {
     Row::new(vec![
-        Cell::from(label.to_string()).style(Style::default().fg(FAINT)),
+        Cell::from(format!("{}{}", " ".repeat(indent), label))
+            .style(Style::default().fg(FAINT)),
         Cell::from(value).style(Style::default().fg(TEXT)),
     ])
 }
 
-fn stat_sub_row(label: &str, value: String) -> Row<'static> {
+fn stat_sub_row(connector: &str, label: &str, value: String) -> Row<'static> {
+    let label = Text::from(Line::from(vec![
+        Span::styled(format!("{connector} "), Style::default().fg(FAINT)),
+        Span::styled(label.to_string(), Style::default().fg(SUBTLE)),
+    ]));
     Row::new(vec![
-        Cell::from(format!("  {label}")).style(Style::default().fg(BORDER)),
-        Cell::from(value).style(Style::default().fg(FAINT)),
+        Cell::from(label),
+        Cell::from(value).style(Style::default().fg(SUBTLE)),
     ])
 }
+
+fn draw_activity(frame: &mut Frame, area: ratatui::layout::Rect, state: &StatsState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(" activity ", Style::default().fg(MUTED)));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if state.period == Period::Global || state.activity.is_empty() {
+        return;
+    }
+
+    let max_tokens = state
+        .activity
+        .iter()
+        .map(|bucket| bucket.tokens)
+        .max()
+        .unwrap_or(0);
+    let columns = (inner.width as usize / 4).max(1);
+
+    let mut lines = Vec::new();
+    let row_count = state.activity.len().div_ceil(columns);
+    for (row, chunk) in state.activity.chunks(columns).enumerate() {
+        let mut spans = Vec::new();
+        for bucket in chunk {
+            let color = ACTIVITY_COLORS[activity_level(bucket.tokens, max_tokens)];
+            if bucket.offset == state.offset {
+                spans.push(Span::styled("[", Style::default().fg(YELLOW)));
+                spans.push(Span::styled("██", Style::default().fg(color)));
+                spans.push(Span::styled("]", Style::default().fg(YELLOW)));
+            } else {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled("██", Style::default().fg(color)));
+                spans.push(Span::raw(" "));
+            }
+        }
+        lines.push(Line::from(spans));
+        if row + 1 < row_count {
+            lines.push(Line::from(""));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn activity_level(tokens: u64, max: u64) -> usize {
+    if tokens == 0 || max == 0 {
+        0
+    } else {
+        ((tokens as f64 / max as f64) * 4.0).ceil() as usize
+    }
+    .clamp(0, 4)
+}
+
+const ACTIVITY_COLORS: [Color; 5] = [
+    Color::Rgb(34, 30, 48),
+    Color::Rgb(57, 45, 91),
+    Color::Rgb(91, 68, 147),
+    Color::Rgb(132, 101, 205),
+    Color::Rgb(196, 173, 255),
+];
 
 fn draw_loading(frame: &mut Frame, area: ratatui::layout::Rect, title: &str) {
     let chunks = Layout::vertical([

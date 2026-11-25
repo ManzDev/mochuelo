@@ -311,7 +311,10 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('b') => app.screen = Screen::List,
             KeyCode::Char('o') => {
                 if let Screen::Serving { url, .. } = &app.screen {
-                    let _ = open_url(url);
+                    let url = url.clone();
+                    app.status = open_url(&url)
+                        .err()
+                        .map(|err| format!("could not open browser: {err}"));
                 }
             }
             KeyCode::Char('q') => app.running = false,
@@ -338,6 +341,7 @@ fn start_selected(app: &mut App, port: u16, open: bool, term: &mut Term) -> Resu
     };
     term.terminal.draw(|frame| draw(frame, app))?;
 
+    let mut open_error = None;
     let started = (|| -> Result<Server> {
         let export = load_export(&session.id)?;
         let html = render::render(&export);
@@ -345,7 +349,7 @@ fn start_selected(app: &mut App, port: u16, open: bool, term: &mut Term) -> Resu
 
         if open {
             server.wait_ready()?;
-            let _ = open_url(server.url());
+            open_error = open_url(server.url()).err();
         }
 
         Ok(server)
@@ -353,6 +357,7 @@ fn start_selected(app: &mut App, port: u16, open: bool, term: &mut Term) -> Resu
 
     match started {
         Ok(server) => {
+            app.status = open_error.map(|err| format!("could not open browser: {err}"));
             app.screen = Screen::Serving {
                 title: session.title().to_string(),
                 id: session.id.clone(),

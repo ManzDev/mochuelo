@@ -11,7 +11,7 @@ use clap::Parser;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use model::Export;
 
@@ -169,6 +169,21 @@ pub(crate) fn open_url(url: &str) -> Result<()> {
         c.arg(url);
         c
     };
+
+    // Detach the browser from the TUI. Chromium-based browsers keep a zygote
+    // process that writes diagnostics to stderr and reuses an existing browser
+    // session; if that stderr is our terminal, those messages land in the
+    // middle of the alternate screen and corrupt it. A separate process group
+    // also keeps the browser alive if mochuelo exits or the terminal is closed.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     cmd.spawn().context("failed to launch browser")?;
     Ok(())
